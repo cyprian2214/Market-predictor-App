@@ -9,7 +9,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import ta
 import time
-import threading
 
 # Set page configuration
 st.set_page_config(
@@ -66,6 +65,8 @@ st.markdown("""
 
 class MarketPredictionApp:
     def __init__(self):
+        self.is_running = False
+        self.predictions = {}
         self.symbols = {
             'NASDAQ-100': '^NDX',
             'S&P 500': '^GSPC',
@@ -77,47 +78,117 @@ class MarketPredictionApp:
             'GBP/USD': 'GBPUSD=X',
             'USD/JPY': 'JPY=X'
         }
-        self.models = {}
-        self.is_running = False
-        self.predictions = {}
         
-    def fetch_data(self, symbol, period='1d', interval='1m'):
+    def fetch_data(self, symbol):
         try:
+            st.write(f"Fetching data for {symbol}...")
+            # Get data from yfinance
             ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval)
+            df = ticker.history(period='1d', interval='1m')
+            
+            if df.empty:
+                st.error(f"No data received for {symbol}")
+                return None
+                
+            st.write(f"Received {len(df)} rows for {symbol}")
             return df
         except Exception as e:
             st.error(f"Error fetching data for {symbol}: {str(e)}")
             return None
 
-    def prepare_features(self, df):
-        if df is None or len(df) < 50:
-            return None, None
+    def prepare_data(self, df):
+        try:
+            if df is None or df.empty:
+                st.error("No data to prepare")
+                return None
+                
+            st.write("Calculating technical indicators...")
+            # Calculate technical indicators
+            df['RSI'] = ta.momentum.rsi(df['Close'])
+            df['MACD'] = ta.trend.macd_diff(df['Close'])
+            df['BB_upper'], df['BB_middle'], df['BB_lower'] = ta.volatility.bollinger_bands(df['Close'])
+            df['EMA'] = ta.trend.ema_indicator(df['Close'])
+            df['SMA'] = ta.trend.sma_indicator(df['Close'])
             
-        # Technical indicators
-        df['RSI'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-        df['MACD'] = ta.trend.MACD(df['Close']).macd()
-        df['MACD_signal'] = ta.trend.MACD(df['Close']).macd_signal()
-        df['BB_upper'] = ta.volatility.BollingerBands(df['Close']).bollinger_hband()
-        df['BB_middle'] = ta.volatility.BollingerBands(df['Close']).bollinger_mavg()
-        df['BB_lower'] = ta.volatility.BollingerBands(df['Close']).bollinger_lband()
-        df['EMA_20'] = ta.trend.EMAIndicator(df['Close'], window=20).ema_indicator()
-        df['SMA_50'] = ta.trend.SMAIndicator(df['Close'], window=50).sma_indicator()
-        
-        # Create features
-        features = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD', 'MACD_signal', 
-                   'BB_upper', 'BB_middle', 'BB_lower', 'EMA_20', 'SMA_50']
-        df = df.dropna()
-        
-        if len(df) < 2:
-            return None, None
+            # Forward fill NaN values
+            df = df.ffill()
             
-        X = df[features].values[:-1]
-        y = df['Close'].values[1:]
-        
-        return X, y, df
+            st.write("Technical indicators calculated successfully")
+            return df
+        except Exception as e:
+            st.error(f"Error preparing data: {str(e)}")
+            return None
 
-    def create_technical_chart(self, df, symbol_name, prediction=None, current_price=None):
+    def make_prediction(self, df):
+        try:
+            if df is None or df.empty:
+                st.error("No data for prediction")
+                return None, None
+                
+            st.write("Preparing features for prediction...")
+            # Prepare features
+            X = df[['RSI', 'MACD', 'BB_upper', 'BB_lower', 'EMA', 'SMA']].values
+            y = df['Close'].values
+            
+            # Train on most recent data
+            train_size = int(len(df) * 0.8)
+            X_train = X[:train_size]
+            y_train = y[:train_size]
+            
+            st.write("Training model...")
+            # Create and train model
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            model.fit(X_train, y_train)
+            
+            # Make prediction
+            latest_features = X[-1].reshape(1, -1)
+            predicted_price = model.predict(latest_features)[0]
+            current_price = df['Close'].iloc[-1]
+            
+            st.write(f"Prediction complete: Current ${current_price:.2f}, Predicted ${predicted_price:.2f}")
+            return predicted_price, current_price
+        except Exception as e:
+            st.error(f"Error making prediction: {str(e)}")
+            return None, None
+
+    def update_predictions(self, selected_symbols):
+        """Update predictions for all selected symbols"""
+        try:
+            for symbol_name in selected_symbols:
+                symbol = self.symbols[symbol_name]
+                
+                # Fetch and prepare data
+                df = self.fetch_data(symbol)
+                if df is not None:
+                    df = self.prepare_data(df)
+                
+                if df is not None:
+                    # Make prediction
+                    predicted_price, current_price = self.make_prediction(df)
+                    
+                    if predicted_price is not None and current_price is not None:
+                        # Store prediction
+                        prediction = {
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'symbol': symbol_name,
+                            'current_price': current_price,
+                            'predicted_price': predicted_price,
+                            'predicted_movement': 'Up' if predicted_price > current_price else 'Down',
+                            'df': df
+                        }
+                        
+                        if symbol not in self.predictions:
+                            self.predictions[symbol] = []
+                        self.predictions[symbol].append(prediction)
+                        
+                        # Keep only last 100 predictions
+                        self.predictions[symbol] = self.predictions[symbol][-100:]
+            
+            return True
+        except Exception as e:
+            return False
+
+    def create_technical_chart(self, df, symbol_name, predicted_price=None, current_price=None):
         # Create figure with secondary y-axis
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                            vertical_spacing=0.03, 
@@ -144,13 +215,13 @@ class MarketPredictionApp:
                      row=1, col=1)
 
         # Add EMA and SMA
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_20'],
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA'],
                                 line=dict(color='blue', width=1),
-                                name='EMA 20'),
+                                name='EMA'),
                      row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'],
+        fig.add_trace(go.Scatter(x=df.index, y=df['SMA'],
                                 line=dict(color='orange', width=1),
-                                name='SMA 50'),
+                                name='SMA'),
                      row=1, col=1)
 
         # Add MACD
@@ -158,18 +229,18 @@ class MarketPredictionApp:
                                 line=dict(color='blue', width=1),
                                 name='MACD'),
                      row=2, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MACD_signal'],
+        fig.add_trace(go.Scatter(x=df.index, y=df['MACD'].rolling(window=9).mean(),
                                 line=dict(color='orange', width=1),
                                 name='Signal'),
                      row=2, col=1)
 
         # Add prediction arrow if available
-        if prediction is not None and current_price is not None:
+        if predicted_price is not None and current_price is not None:
             last_index = df.index[-1]
             next_index = last_index + pd.Timedelta(minutes=1)
             
-            arrow_color = 'green' if prediction > current_price else 'red'
-            arrow_symbol = '⬆' if prediction > current_price else '⬇'
+            arrow_color = 'green' if predicted_price > current_price else 'red'
+            arrow_symbol = '⬆' if predicted_price > current_price else '⬇'
             
             # Add arrow annotation
             fig.add_annotation(
@@ -182,13 +253,13 @@ class MarketPredictionApp:
                 arrowwidth=3,
                 arrowcolor=arrow_color,
                 ax=0,
-                ay=-40 if prediction > current_price else 40
+                ay=-40 if predicted_price > current_price else 40
             )
             
             # Add predicted price line
             fig.add_trace(go.Scatter(
                 x=[last_index, next_index],
-                y=[current_price, prediction],
+                y=[current_price, predicted_price],
                 mode='lines',
                 line=dict(color=arrow_color, dash='dash'),
                 name='Prediction'
@@ -205,73 +276,7 @@ class MarketPredictionApp:
 
         return fig
 
-    def train_model(self, symbol):
-        df = self.fetch_data(symbol, period='5d', interval='1m')
-        X, y, _ = self.prepare_features(df)
-        
-        if X is None or y is None:
-            return None
-            
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X, y)
-        return model
-
-    def make_prediction(self, symbol):
-        try:
-            # Get latest data
-            df = self.fetch_data(symbol, period='1d', interval='1m')
-            if df is None or len(df) < 50:
-                return None, None, None
-                
-            X, _, df_with_features = self.prepare_features(df)
-            if X is None or len(X) == 0:
-                return None, None, None
-                
-            # Get or train model
-            if symbol not in self.models:
-                self.models[symbol] = self.train_model(symbol)
-                
-            if self.models[symbol] is None:
-                return None, None, None
-                
-            # Make prediction
-            latest_features = X[-1].reshape(1, -1)
-            prediction = self.models[symbol].predict(latest_features)[0]
-            current_price = df['Close'].iloc[-1]
-            
-            return prediction, current_price, df_with_features
-            
-        except Exception as e:
-            st.error(f"Error making prediction for {symbol}: {str(e)}")
-            return None, None, None
-
-    def continuous_prediction(self, selected_symbols):
-        while self.is_running:
-            for symbol_name in selected_symbols:
-                symbol = self.symbols[symbol_name]
-                prediction, current_price, df = self.make_prediction(symbol)
-                
-                if prediction is not None and current_price is not None:
-                    if symbol not in self.predictions:
-                        self.predictions[symbol] = []
-                        
-                    self.predictions[symbol].append({
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'symbol': symbol_name,
-                        'current_price': current_price,
-                        'predicted_price': prediction,
-                        'predicted_movement': 'Up' if prediction > current_price else 'Down',
-                        'df': df
-                    })
-                    
-                    # Keep only last 100 predictions
-                    if len(self.predictions[symbol]) > 100:
-                        self.predictions[symbol].pop(0)
-                        
-            time.sleep(60)  # Update every minute
-
 def main():
-    # Header
     st.markdown("""
         <div style='text-align: center; margin-bottom: 2rem;'>
             <h1>Market Prediction Pro</h1>
@@ -279,7 +284,15 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
-    app = MarketPredictionApp()
+    # Initialize session state
+    if 'app' not in st.session_state:
+        st.session_state.app = MarketPredictionApp()
+    if 'is_running' not in st.session_state:
+        st.session_state.is_running = False
+    if 'update_time' not in st.session_state:
+        st.session_state.update_time = time.time()
+        
+    app = st.session_state.app
     
     # Sidebar
     with st.sidebar:
@@ -326,102 +339,85 @@ def main():
         st.markdown("#### Controls")
         start_col, stop_col = st.columns(2)
         with start_col:
-            start_button = st.button("▶ Start")
+            if st.button("▶ Start", type="primary", disabled=st.session_state.is_running):
+                st.session_state.is_running = True
+                app.is_running = True
+                st.success("✅ Started monitoring markets")
+                
         with stop_col:
-            stop_button = st.button("⏹ Stop")
+            if st.button("⏹ Stop", type="secondary", disabled=not st.session_state.is_running):
+                st.session_state.is_running = False
+                app.is_running = False
+                st.info("🛑 Stopped monitoring markets")
     
     # Main content
     if not selected_symbols:
-        st.warning("🎯 Please select at least one market to monitor")
+        st.warning("🎯 Please select at least one market to monitor from the sidebar")
+        st.markdown("""
+        ### Getting Started Guide:
+        1. Select markets to monitor from the sidebar:
+           - Choose from Major Indices (e.g., NASDAQ-100)
+           - Select Tech Stocks (e.g., Apple)
+           - Add Forex Pairs if interested
+        2. Click the "▶ Start" button to begin monitoring
+        3. Wait a few moments for the first predictions to appear
+        4. View real-time predictions and technical analysis in the tabs below
+        """)
         return
-        
-    # Initialize or update app state
-    if start_button:
-        app.is_running = True
-        app.predictions = {}
-        prediction_thread = threading.Thread(
-            target=app.continuous_prediction,
-            args=(selected_symbols,)
-        )
-        prediction_thread.start()
-        st.success("✅ Started monitoring selected markets")
-        
-    if stop_button:
-        app.is_running = False
-        st.info("🛑 Stopped monitoring markets")
+    
+    # Update predictions if running
+    if st.session_state.is_running:
+        current_time = time.time()
+        if current_time - st.session_state.update_time >= 60:  # Update every minute
+            with st.spinner("Updating predictions..."):
+                if app.update_predictions(selected_symbols):
+                    st.session_state.update_time = current_time
     
     # Create tabs for different views
     tab1, tab2 = st.tabs(["📈 Live Analysis", "📊 Historical Data"])
     
     with tab1:
+        if st.session_state.is_running and not app.predictions:
+            st.info("⏳ Gathering initial data and making predictions...")
+        
         # Display predictions in a grid
         for symbol_name in selected_symbols:
             symbol = app.symbols[symbol_name]
             if symbol in app.predictions and app.predictions[symbol]:
                 with st.container():
-                    st.markdown(f"""
-                        <div class='market-header'>
-                            <h3>{symbol_name}</h3>
-                        </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"### {symbol_name}")
                     
                     # Get latest prediction
                     latest = app.predictions[symbol][-1]
                     
-                    # Display metrics with improved styling
+                    # Display metrics
                     col1, col2, col3, col4 = st.columns(4)
-                    
                     with col1:
                         st.metric("Current Price", f"${latest['current_price']:.2f}")
-                    
                     with col2:
                         st.metric("Predicted Price", f"${latest['predicted_price']:.2f}")
-                    
                     with col3:
-                        movement_color = "prediction-up" if latest['predicted_movement'] == "Up" else "prediction-down"
-                        st.markdown(f"""
-                            <div style='text-align: center;'>
-                                <p>Predicted Movement</p>
-                                <p class='{movement_color}'>{latest['predicted_movement']}</p>
-                            </div>
-                        """, unsafe_allow_html=True)
-                    
+                        st.metric("Movement", latest['predicted_movement'])
                     with col4:
                         confidence = abs(latest['predicted_price'] - latest['current_price']) / latest['current_price'] * 100
                         st.metric("Signal Strength", f"{confidence:.1f}%")
                     
                     # Create and display technical chart
-                    fig = app.create_technical_chart(
-                        latest['df'],
-                        symbol_name,
-                        latest['predicted_price'],
-                        latest['current_price']
-                    )
+                    fig = app.create_technical_chart(latest['df'], symbol_name, latest['predicted_price'], latest['current_price'])
                     st.plotly_chart(fig, use_container_width=True)
+            elif st.session_state.is_running:
+                st.info(f"⏳ Gathering data for {symbol_name}...")
     
     with tab2:
-        for symbol_name in selected_symbols:
-            symbol = app.symbols[symbol_name]
-            if symbol in app.predictions and app.predictions[symbol]:
-                st.subheader(f"{symbol_name} - Historical Predictions")
-                history_df = pd.DataFrame([p for p in app.predictions[symbol] if 'df' not in p])
-                
-                # Calculate accuracy metrics
-                history_df['actual_movement'] = history_df['current_price'].diff().gt(0).shift(-1)
-                history_df['prediction_correct'] = (
-                    history_df['predicted_movement'] == 'Up'
-                ) == history_df['actual_movement']
-                
-                # Display accuracy metrics
-                accuracy = history_df['prediction_correct'].mean() * 100
-                st.metric("Prediction Accuracy", f"{accuracy:.1f}%")
-                
-                # Style the dataframe
-                st.dataframe(
-                    history_df[['timestamp', 'current_price', 'predicted_price', 'predicted_movement']],
-                    use_container_width=True,
-                    height=400
-                )
+        if not app.predictions:
+            st.info("Start monitoring to see historical prediction data")
+        else:
+            for symbol_name in selected_symbols:
+                symbol = app.symbols[symbol_name]
+                if symbol in app.predictions and app.predictions[symbol]:
+                    st.subheader(f"{symbol_name} - Historical Predictions")
+                    history_df = pd.DataFrame([p for p in app.predictions[symbol] if 'df' not in p])
+                    st.dataframe(history_df, use_container_width=True)
 
 if __name__ == "__main__":
     main()

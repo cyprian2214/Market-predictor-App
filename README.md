@@ -19,7 +19,7 @@ A professional financial market prediction application built with Python and Str
 
 1. Clone the repository:
 ```bash
-git clone [repository-url]
+git clone https://github.com/Cyprian2214/Market-predictor-App.git
 cd prediction_app
 ```
 
